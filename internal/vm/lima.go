@@ -1,8 +1,10 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -17,7 +19,6 @@ import (
 
 const (
 	InstanceName = "devup"
-	AgentBinary  = "devup-agent"
 	AgentPath    = "/usr/local/bin/devup-agent"
 	TokenPath    = "/etc/devup/token"
 	HealthURL    = "http://127.0.0.1:7777/health"
@@ -47,17 +48,6 @@ func LinuxHint() {
 	os.Exit(0)
 }
 
-// instanceExists returns true if ~/.lima/devup exists (Lima instance dir)
-func instanceExists() bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return false
-	}
-	instDir := filepath.Join(home, ".lima", InstanceName)
-	_, err = os.Stat(instDir)
-	return err == nil
-}
-
 // IsRunning returns true if the instance exists and is running
 func IsRunning() bool {
 	out, err := exec.Command("limactl", "list", "--tty=false", InstanceName).CombinedOutput()
@@ -67,13 +57,9 @@ func IsRunning() bool {
 	return strings.Contains(string(out), "Running")
 }
 
-// Exists returns true if the devup instance already exists (~/.lima/devup)
-func Exists() bool {
-	return instanceExists()
-}
-
 // Up starts the Lima instance and deploys the agent. Idempotent.
-func Up(ctx context.Context, configPath, token string, verbose bool) error {
+// When quiet is true, limactl stdout/stderr are captured; on error, the captured output is included.
+func Up(ctx context.Context, configPath, token string, verbose bool, quiet bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("home dir: %w", err)
@@ -87,15 +73,13 @@ func Up(ctx context.Context, configPath, token string, verbose bool) error {
 			logging.Info("limactl start (existing)", "name", InstanceName)
 		}
 		cmd := exec.CommandContext(ctx, "limactl", "start", "--tty=false", InstanceName)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := runCmd(cmd, quiet); err != nil {
 			if IsRunning() {
-				return ensureAgentRunning(ctx, configPath, token, verbose)
-			}
-			return fmt.Errorf("limactl start: %w", err)
+			return ensureAgentRunning(ctx, token, verbose, quiet)
 		}
-		return ensureAgentRunning(ctx, configPath, token, verbose)
+		return err
+	}
+	return ensureAgentRunning(ctx, token, verbose, quiet)
 	}
 	if os.IsNotExist(statErr) {
 		// No instance: create from YAML
@@ -103,22 +87,34 @@ func Up(ctx context.Context, configPath, token string, verbose bool) error {
 			logging.Info("limactl start (create)", "name", InstanceName, "config", configPath)
 		}
 		cmd := exec.CommandContext(ctx, "limactl", "start", "--tty=false", "--name", InstanceName, configPath)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("limactl start: %w", err)
+		if err := runCmd(cmd, quiet); err != nil {
+			return err
 		}
-		return ensureAgentRunning(ctx, configPath, token, verbose)
+		return ensureAgentRunning(ctx, token, verbose, quiet)
 	}
 	return fmt.Errorf("check instance dir: %w", statErr)
 }
 
-func isAlreadyRunning() bool {
-	return IsRunning()
+func runCmd(cmd *exec.Cmd, quiet bool) error {
+	if quiet {
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		if err := cmd.Run(); err != nil {
+			if buf.Len() > 0 {
+				return fmt.Errorf("%w\n--- limactl output ---\n%s", err, buf.String())
+			}
+			return err
+		}
+		return nil
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // ensureAgentRunning builds agent if needed, copies to VM, writes token, starts service
-func ensureAgentRunning(ctx context.Context, configPath, token string, verbose bool) error {
+func ensureAgentRunning(ctx context.Context, token string, verbose bool, quiet bool) error {
 	// Check if agent is already healthy
 	if err := WaitForAgent(ctx, token, 2*time.Second); err == nil {
 		if verbose {
@@ -132,7 +128,7 @@ func ensureAgentRunning(ctx context.Context, configPath, token string, verbose b
 		return err
 	}
 	defer os.Remove(binaryPath)
-	if err := copyAgentAndStart(ctx, binaryPath, token, verbose); err != nil {
+	if err := copyAgentAndStart(ctx, binaryPath, token, verbose, quiet); err != nil {
 		return err
 	}
 	return WaitForAgent(ctx, token, HealthWait)
@@ -157,7 +153,7 @@ func buildAgent() (string, error) {
 	return path, nil
 }
 
-func copyAgentAndStart(ctx context.Context, binaryPath, token string, verbose bool) error {
+func copyAgentAndStart(ctx context.Context, binaryPath, token string, verbose bool, quiet bool) error {
 	// Copy to /tmp first (limactl copy uses SSH user; /usr/local/bin needs root)
 	if verbose {
 		logging.Info("limactl copy", "src", binaryPath, "dst", InstanceName+":/tmp/devup-agent")
@@ -168,26 +164,32 @@ func copyAgentAndStart(ctx context.Context, binaryPath, token string, verbose bo
 	}
 	// Move to /usr/local/bin and chmod
 	cmd = exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "sudo", "sh", "-c", "mv /tmp/devup-agent "+AgentPath+" && chmod 755 "+AgentPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCmd(cmd, quiet); err != nil {
 		return fmt.Errorf("install agent: %w", err)
 	}
 	// Create /etc/devup and write token via stdin (avoids shell escaping)
 	cmd = exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "sudo", "sh", "-c", "mkdir -p /etc/devup && cat > "+TokenPath)
 	cmd.Stdin = strings.NewReader(token)
+	if quiet {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("write token: %w\n%s", err, out)
 	}
 	// Try systemd first
 	cmd = exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "sudo", "systemctl", "start", "devup-agent")
-	if err := cmd.Run(); err != nil {
+	if err := runCmd(cmd, quiet); err != nil {
 		// Fallback: nohup
 		if verbose {
 			logging.Info("systemctl start failed, using nohup fallback")
 		}
 		fallback := fmt.Sprintf("nohup %s > /var/log/devup-agent.log 2>&1 &", AgentPath)
 		cmd = exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "sudo", "sh", "-c", fallback)
+		if quiet {
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+		}
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("start agent: %w\n%s", err, out)
 		}
@@ -277,6 +279,44 @@ func Status(ctx context.Context, token string) error {
 	}
 	fmt.Println("Agent: healthy")
 	return nil
+}
+
+// CopyToVM copies a file from the host to the VM.
+// dest is the path inside the VM (e.g. /tmp/devup-provision.sh).
+func CopyToVM(ctx context.Context, srcPath, dest string) error {
+	cmd := exec.CommandContext(ctx, "limactl", "copy", "--tty=false", srcPath, InstanceName+":"+dest)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("limactl copy: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// ShellCmd runs a command in the VM via limactl shell.
+// Returns combined stdout+stderr. Use for non-interactive commands.
+func ShellCmd(ctx context.Context, cmd string) (string, error) {
+	c := exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "bash", "-lc", cmd)
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
+// FindLimaConfig locates the devup.yaml Lima config by searching common relative paths.
+func FindLimaConfig() string {
+	for _, base := range []string{".", "..", "../.."} {
+		p := filepath.Join(base, "vm", "lima", "devup.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		dir := filepath.Dir(exe)
+		p := filepath.Join(dir, "vm", "lima", "devup.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "vm/lima/devup.yaml"
 }
 
 // Logs shows agent logs (journalctl first, else /var/log/devup-agent.log)

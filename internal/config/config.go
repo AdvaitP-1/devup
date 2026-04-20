@@ -7,16 +7,56 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
-	ConfigDir  = ".devup"
-	ConfigFile = "config.json"
+	ConfigDir   = ".devup"
+	ConfigFile  = "config.json"
+	LastJobFile = "last_job"
 )
 
 // Config holds host configuration
 type Config struct {
 	Token string `json:"token"`
+}
+
+// LastJobPath returns ~/.devup/last_job
+func LastJobPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	return filepath.Join(home, ConfigDir, LastJobFile), nil
+}
+
+// WriteLastJob writes job id to ~/.devup/last_job
+func WriteLastJob(jobID string) error {
+	p, err := LastJobPath()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("mkdir config: %w", err)
+	}
+	return os.WriteFile(p, []byte(jobID+"\n"), 0600)
+}
+
+// ReadLastJob reads job id from ~/.devup/last_job
+func ReadLastJob() (string, error) {
+	p, err := LastJobPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("no last job; run 'devup dev' or 'devup start' first")
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // Path returns the config file path (~/.devup/config.json)

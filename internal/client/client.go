@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"devup/internal/api"
+	"devup/internal/version"
+	"devup/internal/workspace"
 )
 
 const (
@@ -41,13 +43,32 @@ func New(token string) *Client {
 	}
 }
 
+// NewWithAddr creates a client targeting a specific agent by address and port.
+func NewWithAddr(addr string, port int, token string) *Client {
+	return &Client{
+		baseURL: fmt.Sprintf("http://%s:%d", addr, port),
+		token:   token,
+		http: &http.Client{
+			Timeout: ConnectTimeout,
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: ConnectTimeout,
+			},
+		},
+	}
+}
+
+func (c *Client) setHeaders(req *http.Request) {
+	req.Header.Set("X-Devup-Token", c.token)
+	req.Header.Set("X-Devup-Version", version.Version)
+}
+
 // Health checks agent health
 func (c *Client) Health(ctx context.Context) (*api.HealthResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -77,7 +98,7 @@ func (c *Client) Run(ctx context.Context, req *api.RunRequest, out io.Writer) (i
 	if err != nil {
 		return -1, err
 	}
-	httpReq.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(httpReq)
 	httpReq.Header.Set("Content-Type", "application/json")
 	// No total timeout for streaming
 	streamClient := &http.Client{Transport: c.http.Transport}
@@ -128,7 +149,7 @@ func (c *Client) Start(ctx context.Context, req *api.StartRequest) (string, erro
 	if err != nil {
 		return "", err
 	}
-	httpReq.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(httpReq)
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -157,7 +178,7 @@ func (c *Client) Ps(ctx context.Context) ([]api.JobInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -186,12 +207,16 @@ func (c *Client) Logs(ctx context.Context, jobID string, follow bool, out io.Wri
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(req)
 	httpClient := c.http
 	if follow {
+		// No timeout, no ResponseHeaderTimeout - agent flushes headers immediately
+		// but we must not timeout while waiting for streaming body
+		transport := c.http.Transport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = 0
 		httpClient = &http.Client{
-			Transport: c.http.Transport,
-			Timeout:   0,
+			Transport: transport,
+			Timeout:  0,
 		}
 	}
 	resp, err := httpClient.Do(req)
@@ -221,7 +246,7 @@ func (c *Client) Stop(ctx context.Context, jobID string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
@@ -239,13 +264,106 @@ func (c *Client) Stop(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// SystemInfo fetches tool version info from the agent in a single round-trip
+func (c *Client) SystemInfo(ctx context.Context) (*api.SystemInfoResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/system/info", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setHeaders(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("agent rejected token (401); run 'devup vm reset-token' and restart VM")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("system/info: %s", resp.Status)
+	}
+	var si api.SystemInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&si); err != nil {
+		return nil, err
+	}
+	return &si, nil
+}
+
+// Cluster fetches discovered cluster peers from the agent
+func (c *Client) Cluster(ctx context.Context) ([]api.PeerInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/cluster", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setHeaders(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("agent rejected token (401); run 'devup vm reset-token' and restart VM")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cluster: %s", resp.Status)
+	}
+	var cr api.ClusterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, err
+	}
+	return cr.Peers, nil
+}
+
+// Upload streams a tar archive of dir to the agent's /upload endpoint,
+// returning the remote workspace path. Used for cluster scheduling to ship
+// code to a remote node.
+func (c *Client) Upload(ctx context.Context, dir string) (string, error) {
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- workspace.StreamTar(dir, workspace.DefaultExcludes, pw)
+		pw.Close()
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/upload", pr)
+	if err != nil {
+		return "", err
+	}
+	c.setHeaders(req)
+	req.Header.Set("Content-Type", "application/x-tar")
+
+	uploadClient := &http.Client{Transport: c.http.Transport, Timeout: 0}
+	resp, err := uploadClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if tarErr := <-errCh; tarErr != nil {
+		return "", fmt.Errorf("tar: %w", tarErr)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", fmt.Errorf("agent rejected token (401)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("upload: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var ur api.UploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ur); err != nil {
+		return "", err
+	}
+	return ur.WorkspacePath, nil
+}
+
 // Down stops all running jobs; returns count stopped
 func (c *Client) Down(ctx context.Context) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/down", nil)
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("X-Devup-Token", c.token)
+	c.setHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, err

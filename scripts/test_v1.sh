@@ -128,6 +128,18 @@ limactl shell devup -- sudo systemctl stop devup-agent 2>/dev/null || true
 sleep 2
 "$DEVUP_BIN" vm up
 
+# Step 11b: Default env test (HOME/XDG_CACHE_HOME for dev tools)
+echo "==> Step 11b: Default env test (HOME, XDG_CACHE_HOME)"
+env_out=$("$DEVUP_BIN" run --mount "$DEMO_DIR:/workspace" -- bash -lc 'echo "HOME=$HOME"; echo "XDG_CACHE_HOME=${XDG_CACHE_HOME:-}"')
+if ! echo "$env_out" | grep -q "HOME=/tmp/devup-home"; then
+  echo "FAIL: Default env - HOME should be /tmp/devup-home, got: $env_out"
+  exit 1
+fi
+if ! echo "$env_out" | grep -q "XDG_CACHE_HOME=/tmp/devup-home/.cache"; then
+  echo "FAIL: Default env - XDG_CACHE_HOME should be /tmp/devup-home/.cache, got: $env_out"
+  exit 1
+fi
+
 # Step 12: Start background job
 echo "==> Step 12: Start background job"
 jobid=$("$DEVUP_BIN" start --mount "$DEMO_DIR:/workspace" -- bash -lc "while true; do echo tick; sleep 1; done")
@@ -142,6 +154,13 @@ echo "$ps_out" | grep -q "running" || { echo "FAIL: job should be running"; exit
 echo "==> Step 14: logs contains tick"
 logs_out=$("$DEVUP_BIN" logs "$jobid")
 echo "$logs_out" | grep -q "tick" || { echo "FAIL: logs should contain tick"; exit 1; }
+# Step 14b: logs -f timeout test (start job that sleeps 5s then prints; logs -f must not error)
+echo "==> Step 14b: logs -f timeout test"
+jobid2=$("$DEVUP_BIN" start --mount "$DEMO_DIR:/workspace" -- bash -lc "sleep 5; echo done")
+[[ -n "$jobid2" ]] || { echo "FAIL: start did not return job id"; exit 1; }
+logs_f_out=$("$DEVUP_BIN" logs "$jobid2" -f 2>&1) || true
+echo "$logs_f_out" | grep -q "done" || { echo "FAIL: logs -f should eventually print done, got: $logs_f_out"; exit 1; }
+"$DEVUP_BIN" stop "$jobid2" 2>/dev/null || true
 # Step 15: stop job
 echo "==> Step 15: stop job"
 "$DEVUP_BIN" stop "$jobid"
@@ -157,5 +176,36 @@ for i in 1 2 3 4 5; do
   sleep 1
 done
 
-# Step 18: PASS
+# Step 18: Port release test (stop must free port for next job)
+echo "==> Step 18: Port release test"
+port_job1=$("$DEVUP_BIN" start --mount "$DEMO_DIR:/workspace" --workdir /workspace -- bash -lc 'python3 -c "
+import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"0.0.0.0\", 3000))
+s.listen(1)
+while True: time.sleep(1)
+"')
+[[ -n "$port_job1" ]] || { echo "FAIL: port job 1 did not start"; exit 1; }
+sleep 2
+"$DEVUP_BIN" stop "$port_job1"
+for retry in 1 2 3 4 5 6 7 8 9 10; do
+  port_job2=$("$DEVUP_BIN" start --mount "$DEMO_DIR:/workspace" --workdir /workspace -- bash -lc 'python3 -c "
+import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"0.0.0.0\", 3000))
+s.listen(1)
+while True: time.sleep(1)
+"' 2>&1) || true
+  port_job2=$(echo "$port_job2" | grep -E '^[a-f0-9]+$' | tail -1)
+  if [[ -n "$port_job2" ]]; then
+    "$DEVUP_BIN" stop "$port_job2" 2>/dev/null || true
+    break
+  fi
+  [[ $retry -eq 10 ]] && { echo "FAIL: port 3000 not released after stop (EADDRINUSE), got: $port_job2"; exit 1; }
+  sleep 0.2
+done
+
+# Step 19: PASS
 echo "PASS"

@@ -22,17 +22,17 @@ portForwards:
     hostPort: 7777
     proto: "tcp"
 
-# Provision: install deps, create systemd unit for devup-agent
+# Provision: install deps, create systemd unit for devup-agent, install base toolchains
 # Agent binary is copied by host on first vm up; systemd starts it
-# Fallback: if systemd fails, run nohup ... > /var/log/devup-agent.log
+# Toolchains: Node, Python, Go, C/C++ (see scripts/vm-provision.sh; YAML embeds same logic)
 provision:
   - mode: system
     script: |
       #!/bin/bash
       set -eux -o pipefail
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y ca-certificates curl python3
+      apt-get update -y
+      apt-get install -y ca-certificates curl python3 git gnupg build-essential make pkg-config gcc g++ python3-venv python3-pip golang-go
       mkdir -p /etc/devup
       cat > /etc/systemd/system/devup-agent.service << 'SVC'
       [Unit]
@@ -47,3 +47,26 @@ provision:
       SVC
       systemctl daemon-reload
       systemctl enable devup-agent.service
+      # Node.js 20 LTS (NodeSource; fallback to Ubuntu nodejs on failure)
+      if ! command -v node &>/dev/null; then
+        NODESOURCE_OK=0
+        if mkdir -p /etc/apt/keyrings 2>/dev/null; then
+          if curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key 2>/dev/null | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg 2>/dev/null; then
+            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+            apt-get update -y
+            if apt-get install -y nodejs 2>/dev/null; then NODESOURCE_OK=1; fi
+          fi
+        fi
+        if [ "$NODESOURCE_OK" = "0" ]; then
+          echo "NodeSource failed, falling back to Ubuntu nodejs"
+          apt-get install -y nodejs npm 2>/dev/null || apt-get install -y nodejs 2>/dev/null || true
+        fi
+      fi
+      apt-get install -y cmake clang 2>/dev/null || true
+      if command -v npm &>/dev/null; then npm config set prefix /usr/local 2>/dev/null || true; npm i -g pnpm@9 2>/dev/null || true; fi
+      # mise (JIT toolchain manager)
+      if ! command -v mise &>/dev/null; then
+        curl -fsSL https://mise.run 2>/dev/null | sh 2>/dev/null || true
+        if [ -f "$HOME/.local/bin/mise" ]; then ln -sf "$HOME/.local/bin/mise" /usr/local/bin/mise; fi
+      fi
+      mkdir -p /opt/devup/mise

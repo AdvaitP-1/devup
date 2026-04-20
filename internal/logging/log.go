@@ -3,7 +3,6 @@ package logging
 import (
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 )
@@ -29,9 +28,4 @@ func Info(msg string, keyvals ...interface{}) {
 // Error logs at error level
 func Error(msg string, keyvals ...interface{}) {
 	Log("error", msg, keyvals...)
-}
-
-// Verbose returns true if DEVUP_VERBOSE=1
-func Verbose() bool {
-	return os.Getenv("DEVUP_VERBOSE") == "1"
 }
